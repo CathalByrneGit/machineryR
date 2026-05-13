@@ -1,0 +1,340 @@
+
+<!-- README.md is generated from README.Rmd. Please edit that file. -->
+
+# machineryR
+
+**State-machine workflow orchestration for ontology-based processes.**
+
+machineryR models real-world workflows as defined processes with states,
+transitions, human-in-the-loop steps, automated triggers, and oversight
+dashboards. It sits directly above `actionTypesR` in the stack:
+
+    actionTypesR   — single-action dispatch
+         ↓
+    machineryR     — multi-step workflow orchestration
+         ↓
+    objectExploreR — process dashboard module (optional)
+
+Where `actionTypesR` handles one action at a time, machineryR sequences
+multiple actions, enforces ordering, tracks the state each object
+instance is in, handles failures and retries, and surfaces what needs
+human attention.
+
+## Installation
+
+``` r
+# install.packages("pak")
+pak::pak("CathalByrneGit/machineryR")
+```
+
+## Core concepts
+
+| Concept        | Description                                                                  |
+|----------------|------------------------------------------------------------------------------|
+| **Process**    | A workflow definition: named states + transitions for one object type        |
+| **Instance**   | One object moving through a process; has a current state and history         |
+| **State**      | A named step in the workflow, optionally with an SLA                         |
+| **Transition** | A directed edge from one state to another, fired by a trigger                |
+| **Trigger**    | What fires a transition: an action, a condition, a manual step, or a timeout |
+
+### Trigger types
+
+| Trigger   | Constructor               | When it fires                                                   |
+|-----------|---------------------------|-----------------------------------------------------------------|
+| Action    | `mac_action_trigger()`    | When a named `actionTypesR` action is submitted for this object |
+| Condition | `mac_condition_trigger()` | When a SQL expression evaluates to `TRUE` for this object       |
+| Manual    | `mac_manual_trigger()`    | When `mac_advance()` is called by an authorised actor           |
+| Timeout   | `mac_timeout_trigger()`   | After the instance has been in a state for longer than N hours  |
+
+## Quick start
+
+### 1. Define a process
+
+``` r
+library(machineryR)
+
+discharge_process <- mac_process(
+  id             = "patient_discharge",
+  name           = "Patient Discharge Workflow",
+  object_type_id = "Encounter",
+  initial_state  = "admitted",
+  table_name     = "encounters",   # for condition trigger evaluation
+  key_column     = "encounter_id",
+  states = list(
+    mac_state("admitted",           display_name = "Admitted",           sla_hours = 72),
+    mac_state("discharge_eligible", display_name = "Discharge Eligible", sla_hours = 24),
+    mac_state("pending_approval",   display_name = "Pending Approval",   sla_hours = 4),
+    mac_state("discharged",         display_name = "Discharged",         terminal = TRUE),
+    mac_state("escalated",          display_name = "Escalated",          terminal = TRUE)
+  ),
+  transitions = list(
+    mac_transition(
+      from    = "admitted",
+      to      = "discharge_eligible",
+      trigger = mac_condition_trigger("ready_for_discharge = TRUE",
+                                      check_interval_mins = 30L)
+    ),
+    mac_transition(
+      from    = "discharge_eligible",
+      to      = "pending_approval",
+      trigger = mac_action_trigger("InitiateDischarge")
+    ),
+    mac_transition(
+      from    = "pending_approval",
+      to      = "discharged",
+      trigger = mac_manual_trigger(required_role = "discharge_approver")
+    ),
+    mac_transition(
+      from    = "pending_approval",
+      to      = "escalated",
+      trigger = mac_timeout_trigger(hours = 4)
+    )
+  )
+)
+```
+
+### 2. Create a context and register
+
+``` r
+library(DBI)
+library(duckdb)
+
+con <- dbConnect(duckdb(), "workflow.duckdb")
+ctx <- mac_context(bundle = "hospital_ops", connection = con)
+
+mac_register(ctx, discharge_process)
+#> ✔ Registered process 'patient_discharge' (5 states, 4 transitions).
+```
+
+### 3. Start instances
+
+``` r
+iid <- mac_start(ctx, process_id = "patient_discharge", object_key = "enc_001")
+#> ✔ Started instance 'inst_...' for object 'enc_001' in process 'patient_discharge'
+#>   (state: admitted).
+
+mac_state_of(ctx, iid)
+#> [1] "admitted"
+```
+
+### 4. Drive transitions
+
+**Condition trigger** — evaluated on a schedule or on demand:
+
+``` r
+# Mark the encounter as ready in the source table
+dbExecute(con, "UPDATE encounters SET ready_for_discharge = TRUE WHERE encounter_id = 'enc_001'")
+
+mac_check_conditions(ctx, process_id = "patient_discharge")
+mac_state_of(ctx, iid)
+#> [1] "discharge_eligible"
+```
+
+**Action trigger** — fired when an `actionTypesR` action is submitted:
+
+``` r
+# Wire machineryR into your actionTypesR context
+action_ctx <- mac_wire_actions(ctx, action_ctx)
+
+# Now any submit_action("InitiateDischarge", target_ids = "enc_001") will
+# automatically advance the matching instance.
+
+# Or call the trigger directly:
+mac_check_action_triggers(ctx,
+  action_type_id = "InitiateDischarge",
+  target_ids     = "enc_001",
+  submission_id  = "sub_abc"
+)
+mac_state_of(ctx, iid)
+#> [1] "pending_approval"
+```
+
+**Manual trigger** — a human approves the next step:
+
+``` r
+mac_advance(ctx, iid, actor = "dr_smith", notes = "Patient stable, ready to go.")
+#> ✔ Advanced instance '...': pending_approval -> discharged (by dr_smith).
+
+mac_state_of(ctx, iid)
+#> [1] "discharged"
+```
+
+**Timeout trigger** — fires automatically after the configured duration:
+
+``` r
+# mac_check_timeouts() is called on a schedule (cron, background job, etc.)
+mac_check_timeouts(ctx, process_id = "patient_discharge")
+# Any instance stuck in pending_approval for > 4 h is moved to escalated.
+```
+
+### 5. Inspect history
+
+``` r
+mac_history(ctx, iid)
+#>   transition_id instance_id from_state         to_state trigger_type
+#> 1       tr_...      inst_...   admitted discharge_eligible    condition
+#> 2       tr_...      inst_... discharge_eligible pending_approval   action
+#> 3       tr_...      inst_... pending_approval     discharged       manual
+```
+
+## Observability
+
+``` r
+# Counts per state + average time in state + overdue count
+mac_summary(ctx, "patient_discharge")
+#>                state count avg_hours_in_state overdue_count
+#> 1           admitted     3               18.2             0
+#> 2 discharge_eligible     1                6.1             1
+#> 3   pending_approval     2                5.8             2
+#> 4         discharged    12                0.0             0
+#> 5          escalated     1                0.0             0
+
+# Which instances are past their SLA?
+mac_overdue(ctx, "patient_discharge")
+
+# Which states are the biggest bottlenecks?
+mac_bottlenecks(ctx, "patient_discharge")
+
+# All instances currently in a specific state
+mac_instances_in(ctx, "patient_discharge", state = "pending_approval")
+```
+
+## Guards and callbacks
+
+### Guard functions
+
+A guard blocks a transition when it returns `FALSE`. The transition
+stays pending until the guard allows it.
+
+``` r
+mac_transition(
+  from     = "pending_approval",
+  to       = "discharged",
+  trigger  = mac_manual_trigger(required_role = "discharge_approver"),
+  guard_fn = function(instance, ctx) {
+    # Block discharge if an audit flag is set
+    flag <- DBI::dbGetQuery(ctx$ctx$con,
+      "SELECT audit_flag FROM encounters WHERE encounter_id = ?",
+      params = list(instance$object_key[[1]]))
+    !isTRUE(flag$audit_flag[[1]])
+  }
+)
+```
+
+### `on_enter` callbacks
+
+`on_enter` fires every time an instance enters the target state. Use it
+to send notifications, log events, or trigger downstream jobs.
+
+``` r
+mac_transition(
+  from     = "pending_approval",
+  to       = "discharged",
+  trigger  = mac_manual_trigger(),
+  on_enter = function(instance, ctx) {
+    notify_patient(instance$object_key[[1]])
+  }
+)
+```
+
+## Shiny dashboard
+
+machineryR ships a Shiny module that renders a live process dashboard:
+
+``` r
+library(shiny)
+
+ui <- fluidPage(
+  process_dashboard_ui("discharge")
+)
+
+server <- function(input, output, session) {
+  process_dashboard_server(
+    id           = "discharge",
+    mac_ctx_r    = reactive(ctx),
+    process_id_r = reactive("patient_discharge")
+  )
+}
+
+shinyApp(ui, server)
+```
+
+The dashboard includes:
+
+- **State distribution** bar chart (count per state)
+- **Process flow diagram** (states as nodes, transitions as edges,
+  coloured by terminal/active)
+- **Overdue instances** table with object key, state, and hours overdue
+- **Instance detail** — click a row to see the full transition history
+
+## Validation
+
+`mac_register()` validates the process definition before storing it and
+aborts with a clear message if:
+
+- `initial_state` is not among the defined states
+- A transition references an undefined `from` or `to` state
+- A terminal state has an outgoing transition
+- A non-initial, non-terminal state is unreachable from `initial_state`
+- A non-terminal state has no outgoing transitions (dead end)
+- Duplicate state names are found
+
+``` r
+bad_process <- mac_process(
+  id = "broken", name = "Broken", object_type_id = "Thing",
+  initial_state = "start",
+  states = list(
+    mac_state("start", sla_hours = 1),
+    mac_state("end",   terminal  = TRUE),
+    mac_state("orphan")             # unreachable — no transition leads here
+  ),
+  transitions = list(
+    mac_transition("start", "end", trigger = mac_manual_trigger()),
+    mac_transition("orphan", "end", trigger = mac_manual_trigger())
+  )
+)
+
+mac_register(ctx, bad_process)
+#> Error: Process 'broken': states unreachable from initial_state 'start': orphan
+```
+
+## Database schema
+
+machineryR initialises three tables on first use:
+
+| Table             | Purpose                              |
+|-------------------|--------------------------------------|
+| `mac_processes`   | Serialised process definitions       |
+| `mac_instances`   | One row per tracked object instance  |
+| `mac_transitions` | Full audit log of every state change |
+
+## Package architecture
+
+    R/
+      context.R      mac_context()              schema init, process registry
+      process.R      mac_process / mac_state    DSL constructors
+                     mac_*_trigger
+                     mac_transition
+      validation.R   mac_validate_process()     pre-registration checks
+      register.R     mac_register()             store + retrieve process defs
+                     mac_get_process()
+                     mac_list_processes()
+      instance.R     mac_start()                instance lifecycle
+                     mac_advance()
+                     mac_state_of()
+                     mac_history()
+      engine.R       mac_check_conditions()     automated trigger evaluation
+                     mac_check_timeouts()
+                     mac_apply_transition()     internal transition workhorse
+      integration.R  mac_wire_actions()         actionTypesR bridge
+                     mac_check_action_triggers()
+      observe.R      mac_summary()              process observability
+                     mac_instances_in()
+                     mac_bottlenecks()
+                     mac_overdue()
+      dashboard.R    process_dashboard_ui()     Shiny module
+                     process_dashboard_server()
+
+## License
+
+MIT
