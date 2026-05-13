@@ -1,22 +1,33 @@
 # Serialize process to JSON (functions stored as source strings)
 process_to_json <- function(process) {
-  p <- process
-  p$transitions <- lapply(process$transitions, function(tr) {
+  # Build a plain list (no S3 classes) for JSON serialization
+  transitions_plain <- lapply(process$transitions, function(tr) {
+    # Strip class from trigger
+    trig <- unclass(tr$trigger)
     list(
       from = tr$from,
       to = tr$to,
-      trigger = tr$trigger,
+      trigger = trig,
       guard_fn_src = fn_to_char(tr$guard_fn),
       on_enter_src = fn_to_char(tr$on_enter)
     )
   })
-  # states to plain list
-  p$states <- lapply(process$states, function(st) {
+  states_plain <- lapply(process$states, function(st) {
     list(name = st$name, display_name = st$display_name,
          terminal = st$terminal, sla_hours = st$sla_hours,
          description = st$description)
   })
-  jsonlite::toJSON(p, auto_unbox = TRUE, null = "null")
+  p_plain <- list(
+    id             = process$id,
+    name           = process$name,
+    object_type_id = process$object_type_id,
+    states         = states_plain,
+    transitions    = transitions_plain,
+    initial_state  = process$initial_state,
+    table_name     = process$table_name,
+    key_column     = process$key_column
+  )
+  jsonlite::toJSON(p_plain, auto_unbox = TRUE, null = "null")
 }
 
 # Deserialize process from JSON
