@@ -1,0 +1,31 @@
+Package: machineryR
+Title: State-Machine Workflow Orchestration for Ontology-Based Processes
+Version: 0.1.0
+Authors@R: c(
+    person("Cathal", "Byrne", role = c("aut", "cre"), email = "cathal@example.com")
+  )
+Description: Define multi-step workflows as state machines over ontology object types.
+    Transitions are triggered by actions, automated conditions, or human approval.
+    Tracks per-instance workflow state, enforces ordering, handles retries, and
+    surfaces bottlenecks in a process dashboard.
+Depends: R (>= 4.0)
+Imports:
+    DBI,
+    dplyr,
+    rlang,
+    jsonlite,
+    cli
+Suggests:
+    duckdb,
+    shiny,
+    bslib,
+    DT,
+    visNetwork,
+    testthat (>= 3.0.0),
+    knitr,
+    rmarkdown,
+    withr
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.1

@@ -1,0 +1,5 @@
+^\.git$
+^\.gitignore$
+^.*\.Rproj$
+^\.Rproj\.user$
+^tests/testthat/helper.*$
